@@ -1,184 +1,273 @@
-"""
-Reshape MHCLG Council Taxbase LA-level workbooks (2024 .ods, 2025 .xlsx)
-into two tidy, Tableau-ready CSVs.
-"""
-import re, pandas as pd, numpy as np
-
-SRC = "/mnt/user-data/uploads/OneDrive-LondonSchoolofEconomics/Data School"
-OUT = "******"
-import os; os.makedirs(OUT, exist_ok=True)
-
-ID_COLS = ["E-code", "ONS Code", "Region", "Local Authority", "Notes"]
 
 
-def read_sheet(path, sheet, engine=None):
-    return pd.read_excel(path, sheet_name=sheet, header=None, engine=engine)
+import re
+import pandas as pd
 
+OUT = "tidy"
 
-def blocks(df):
-    """Split a *_Data sheet into (table_title, sub-dataframe) blocks.
-    Row 5 (idx 4) holds sparse table titles at each block's first column.
-    Row 6 (idx 5) holds column headers. Data starts row 7 (idx 6)."""
-    titles = df.iloc[4]
-    heads = df.iloc[5]
-    starts = [(i, str(v).strip()) for i, v in titles.items() if pd.notna(v)]
-    out = []
-    for n, (c0, title) in enumerate(starts):
-        c1 = starts[n + 1][0] if n + 1 < len(starts) else df.shape[1]
-        cols = list(range(c0, c1))
-        sub = df.iloc[6:, cols].copy()
-        sub.columns = [str(heads[c]).strip() for c in cols]
-        out.append((title, sub))
-    return out
-
-
-def ids(df):
-    d = df.iloc[6:, 0:5].copy()
-    d.columns = ID_COLS
-    for c in ID_COLS:
-        d[c] = d[c].astype(str).str.strip()
-    return d.reset_index(drop=True)
-
-
-def tidy(path, year, sheets, engine=None):
-    rows = []
-    for sheet in sheets:
-        try:
-            df = read_sheet(path, sheet, engine)
-        except Exception as e:
-            print(f"  ! skip {sheet}: {e}")
-            continue
-        idf = ids(df)
-        for title, sub in blocks(df):
-            m = re.match(r"Table\s+([\d.]+)\.?\s*(.*)", title, re.S)
-            tid = m.group(1).rstrip(".") if m else ""
-            tname = re.sub(r"\s+", " ", (m.group(2) if m else title)).strip()
-            sub = sub.reset_index(drop=True)
-            for col in sub.columns:
-                if col in ("nan", "Notes", ""):
-                    continue
-                vals = pd.to_numeric(sub[col], errors="coerce")
-                keep = vals.notna()
-                if not keep.any():
-                    continue
-                blk = idf[keep].copy()
-                blk["year"] = year
-                blk["sheet"] = sheet.replace("_", " ")
-                blk["table_id"] = tid
-                blk["table_name"] = tname
-                blk["band"] = col
-                blk["value"] = vals[keep].values
-                rows.append(blk)
-    t = pd.concat(rows, ignore_index=True)
-    t = t.rename(columns={"E-code": "e_code", "ONS Code": "ons_code",
-                          "Region": "region", "Local Authority": "local_authority"})
-    return t[["year", "e_code", "ons_code", "region", "local_authority",
-              "sheet", "table_id", "table_name", "band", "value"]]
-
-
-print("2025 (xlsx)…")
-p25 = f"{SRC}/2025_Local_Authority_Drop_Down-2.xlsx"
-t25 = tidy(p25, 2025, ["Council Taxbase Data", "Second Homes Data", "Empty Properties Data"])
-
-print("2024 (ods)…")
-p24 = f"{SRC}/Council_Taxbase_Local_Authority_Level_Data_2024.ods"
-t24 = tidy(p24, 2024, ["Council_Taxbase_Data", "Flex_Empty_Data"], engine="odf")
-
-long = pd.concat([t24, t25], ignore_index=True)
-long.to_csv(f"{OUT}/ctb_long_2024_2025.csv", index=False)
-print(f"  long rows: {len(long):,}")
-
-
-# Match on title text, not table number: numbering shifts between years.
-WANT = {
-    "total_dwellings":        r"Total Number of Dwellings on Valuation List",
-    "chargeable_adj":         r"chargeable dwellings adjusted in accordance with lines 5 and 6",
-    "second_homes":           r"classed as second homes on .* \(Line 11\)",
-    "second_homes_premium":   r"classed as second homes and being charged the Second Homes Premium",
-    "empty_total":            r"Total number of dwellings in line 7 classed as empty",
-    "empty_premium":          r"classed as empty and being charged the Empty Homes Premium",
-    "empty_over_6m":          r"classed as empty on .* and have been for more than 6 months.*\(Line 16\)",
+FILES = {
+    2022: ("raw/Council_Taxbase_local_authority_level_data_2022.ods",
+           ["Council_Taxbase_Data", "Flex_Empty_Data"], "odf"),
+    2023: ("raw/Council_Taxbase_Local_Authority_Level_Data_2023__revised_.ods",
+           ["Council_Taxbase_Data", "Flex_Empty_Data"], "odf"),
+    2024: ("Council_Taxbase_Local_Authority_Level_Data_2024.ods",
+           ["Council_Taxbase_Data", "Flex_Empty_Data"], "odf"),
+    2025: ("2025_Local_Authority_Drop_Down-2.xlsx",
+           ["Council Taxbase Data", "Second Homes Data", "Empty Properties Data"], None),
 }
 
-tot = long[long.band.eq("Total")]
-frames = []
-for name, pat in WANT.items():
-    sel = tot[tot.table_name.str.contains(pat, regex=True, na=False)]
-    sel = sel.drop_duplicates(["year", "ons_code"])
-    if sel.empty:
-        print(f"  ! no match: {name}")
-        continue
-    frames.append(sel.assign(measure=name)[
-        ["year", "e_code", "ons_code", "region", "local_authority", "measure", "value"]])
 
-w = (pd.concat(frames)
-       .pivot_table(index=["year", "e_code", "ons_code", "region", "local_authority"],
-                    columns="measure", values="value", aggfunc="first")
-       .reset_index())
-w.columns.name = None
 
-# rates per 1,000 chargeable dwellings
-base = w["chargeable_adj"].replace(0, np.nan)
-w["second_homes_per_1000"] = (w["second_homes"] / base * 1000).round(2)
-w["empty_total_per_1000"] = (w["empty_total"] / base * 1000).round(2)
-if "second_homes_premium" in w:
-    w["pct_second_homes_charged_premium"] = (
-        w["second_homes_premium"] / w["second_homes"].replace(0, np.nan) * 100).round(1)
-w["pct_empty_charged_premium"] = (
-    w["empty_premium"] / w["empty_total"].replace(0, np.nan) * 100).round(1)
+WANTED = {
+    "total_dwellings":      r"Total Number of Dwellings on Valuation List",
+    "chargeable_adj":       r"chargeable dwellings adjusted in accordance with lines 5 and 6",
+    "second_homes":         r"classed as second homes on .* \(Line 11\)",
+    "second_homes_premium": r"classed as second homes and being charged the Second Homes Premium",
+    "empty_total":          r"Total number of dwellings in line 7 classed as empty",
+    "empty_premium":        r"classed as empty and being charged the Empty Homes Premium",
+    "empty_over_6m":        r"classed as empty on .* and have been for more than 6 months.*\(Line 16\)",
+}
 
-w.to_csv(f"{OUT}/ctb_la_headline_long.csv", index=False)
+REGIONS = {
+    "NE": "North East", "NW": "North West", "YH": "Yorkshire and The Humber",
+    "EM": "East Midlands", "WM": "West Midlands", "E": "East of England",
+    "L": "London", "SE": "South East", "SW": "South West", "ENG": "England",
+}
 
-# ONS reissued codes for Barnsley and Sheffield between the two releases.
+
 RECODE = {"E08000016": "E08000038", "E08000019": "E08000039"}
-w["ons_code"] = w["ons_code"].replace(RECODE)
-long["ons_code"] = long["ons_code"].replace(RECODE)
-long.to_csv(f"{OUT}/ctb_long_2024_2025.csv", index=False)
-w.to_csv(f"{OUT}/ctb_la_headline_long.csv", index=False)
 
-a = w[w.year.eq(2024)].set_index("ons_code")
-b = w[w.year.eq(2025)].set_index("ons_code")
-common = b.index.intersection(a.index)
-chg = pd.DataFrame({
-    "ons_code": common,
-    "local_authority": b.loc[common, "local_authority"],
-    "region": b.loc[common, "region"],
-    "second_homes_2024": a.loc[common, "second_homes"],
-    "second_homes_2025": b.loc[common, "second_homes"],
-    "empty_total_2024": a.loc[common, "empty_total"],
-    "empty_total_2025": b.loc[common, "empty_total"],
-    "chargeable_2025": b.loc[common, "chargeable_adj"],
-    "sh_per1000_2024": a.loc[common, "second_homes_per_1000"],
-    "sh_per1000_2025": b.loc[common, "second_homes_per_1000"],
-    "empty_per1000_2024": a.loc[common, "empty_total_per_1000"],
-    "empty_per1000_2025": b.loc[common, "empty_total_per_1000"],
-    "pct_sh_charged_premium_2025": b.loc[common, "pct_second_homes_charged_premium"]
-        if "pct_second_homes_charged_premium" in b else np.nan,
+# The May 2024 boundary file still uses the old codes, so the map joins on
+# lad24cd, which maps back the other way. Get this the wrong way round and
+# Barnsley and Sheffield silently vanish from the map.
+BOUNDARY_CODE = {"E08000038": "E08000016", "E08000039": "E08000019"}
+
+ID_COLS = ["e_code", "ons_code", "region", "local_authority", "notes"]
+
+
+def split_tables(sheet):
+    """One sheet holds several tables side by side. Row 5 has the table
+    titles, but only in each table's first column, and row 6 has the column
+    headers. So I find the columns where a title appears and use them as the
+    start of each table."""
+    titles = sheet.iloc[4]
+    headers = sheet.iloc[5]
+    starts = []
+    for col, value in titles.items():
+        if pd.notna(value):
+            starts.append((col, str(value).strip()))
+
+    tables = []
+    for i in range(len(starts)):
+        first_col = starts[i][0]
+        title = starts[i][1]
+        if i + 1 < len(starts):
+            last_col = starts[i + 1][0]
+        else:
+            last_col = sheet.shape[1]
+        cols = list(range(first_col, last_col))
+        table = sheet.iloc[6:, cols].copy()
+        table.columns = [str(headers[c]).strip() for c in cols]
+        tables.append((title, table))
+    return tables
+
+
+def get_ids(sheet):
+    """The first five columns are the same on every sheet: E-code, ONS code,
+    region, authority name, notes."""
+    ids = sheet.iloc[6:, 0:5].copy()
+    ids.columns = ID_COLS
+    for col in ID_COLS:
+        ids[col] = ids[col].astype(str).str.strip()
+    return ids.reset_index(drop=True)
+
+
+def read_year(path, year, sheet_names, engine):
+    """Turn one workbook into long rows: one row per authority, table and column."""
+    rows = []
+    for sheet_name in sheet_names:
+        sheet = pd.read_excel(path, sheet_name=sheet_name, header=None, engine=engine)
+        ids = get_ids(sheet)
+
+        for title, table in split_tables(sheet):
+            # Titles look like "Table 1.04. Something something".
+            match = re.match(r"Table\s+([\d.]+)\.?\s*(.*)", title, re.S)
+            if match:
+                table_name = re.sub(r"\s+", " ", match.group(2)).strip()
+            else:
+                table_name = title
+
+            table = table.reset_index(drop=True)
+            for col in table.columns:
+                if col in ("nan", "notes", "Notes", ""):
+                    continue
+                values = pd.to_numeric(table[col], errors="coerce")
+                keep = values.notna()
+                if not keep.any():
+                    continue
+                block = ids[keep].copy()
+                block["year"] = year
+                block["table_name"] = table_name
+                block["band"] = col
+                block["value"] = values[keep].values
+                rows.append(block)
+
+    return pd.concat(rows, ignore_index=True)
+
+
+
+
+long_rows = []
+for year in sorted(FILES):
+    path, sheet_names, engine = FILES[year]
+    print("reading", year, path)
+    long_rows.append(read_year(path, year, sheet_names, engine))
+
+long = pd.concat(long_rows, ignore_index=True)
+print("long rows:", len(long))
+
+
+
+totals = long[long.band == "Total"]
+
+found = []
+for measure, pattern in WANTED.items():
+    hits = totals[totals.table_name.str.contains(pattern, regex=True, na=False)]
+    hits = hits.drop_duplicates(["year", "ons_code"])
+    if len(hits) == 0:
+        # second_homes_premium only exists from 2025, so this is expected there
+        print("  no match for", measure)
+        continue
+    hits = hits.assign(measure=measure)
+    found.append(hits[["year", "e_code", "ons_code", "region", "local_authority",
+                       "measure", "value"]])
+
+wide = pd.concat(found).pivot_table(
+    index=["year", "e_code", "ons_code", "region", "local_authority"],
+    columns="measure", values="value", aggfunc="first").reset_index()
+wide.columns.name = None
+
+wide["ons_code"] = wide["ons_code"].replace(RECODE)
+wide["lad24cd"] = wide["ons_code"].replace(BOUNDARY_CODE)
+wide["region_name"] = wide["region"].map(REGIONS)
+
+# rates per 1,000 chargeable dwellings, so big and small authorities compare
+chargeable = wide["chargeable_adj"].replace(0, float("nan"))
+wide["second_homes_per_1000"] = (wide["second_homes"] / chargeable * 1000).round(2)
+wide["empty_total_per_1000"] = (wide["empty_total"] / chargeable * 1000).round(2)
+wide["pct_second_homes_charged_premium"] = (
+    wide["second_homes_premium"] / wide["second_homes"].replace(0, float("nan")) * 100).round(1)
+wide["pct_empty_charged_premium"] = (
+    wide["empty_premium"] / wide["empty_total"].replace(0, float("nan")) * 100).round(1)
+
+# Seventeen districts in Cumbria, North Yorkshire and Somerset were replaced by
+# four unitary councils in April 2023, so 2022 does not line up with the years
+# after it. This flag marks the authorities that are the same from 2023 on.
+# England is flagged False because it is a total, not an authority.
+codes_2023_on = set(wide[wide.year == 2023].ons_code)
+for year in (2024, 2025):
+    codes_2023_on = codes_2023_on & set(wide[wide.year == year].ons_code)
+wide["la_comparable_2023_2025"] = (wide.ons_code.isin(codes_2023_on)
+                                   & (wide.ons_code != "E92000001"))
+
+headline_cols = ["year", "e_code", "ons_code", "lad24cd", "region", "region_name",
+                 "local_authority", "chargeable_adj", "empty_over_6m", "empty_premium",
+                 "empty_total", "second_homes", "second_homes_premium", "total_dwellings",
+                 "second_homes_per_1000", "empty_total_per_1000",
+                 "pct_second_homes_charged_premium", "pct_empty_charged_premium",
+                 "la_comparable_2023_2025"]
+wide = wide[headline_cols]
+wide.to_csv(OUT + "/ctb_la_headline_2022_2025.csv", index=False)
+print("headline rows:", len(wide))
+
+
+
+
+
+england = wide[wide.ons_code == "E92000001"].set_index("year")
+
+trend_rows = []
+for measure, column in [("Second homes", "second_homes"),
+                        ("Empty dwellings (all)", "empty_total"),
+                        ("Empty over 6 months", "empty_over_6m")]:
+    base = england.loc[2022, column]
+    for year in sorted(england.index):
+        count = england.loc[year, column]
+        trend_rows.append({
+            "year": year,
+            "measure": measure,
+            "dwellings": int(count),
+            "per_1000_chargeable": round(count / england.loc[year, "chargeable_adj"] * 1000, 2),
+            "index_2022_100": round(count / base * 100, 1),
+        })
+
+trend = pd.DataFrame(trend_rows)
+trend.to_csv(OUT + "/england_trend_2022_2025.csv", index=False)
+
+
+
+authorities = wide[wide.ons_code != "E92000001"]
+before = authorities[authorities.year == 2024].set_index("ons_code")
+after = authorities[authorities.year == 2025].set_index("ons_code")
+both = after.index.intersection(before.index)
+
+change = pd.DataFrame({
+    "ons_code": both,
+    "lad24cd": after.loc[both, "lad24cd"],
+    "local_authority": after.loc[both, "local_authority"],
+    "region": after.loc[both, "region"],
+    "region_name": after.loc[both, "region_name"],
+    "second_homes_2024": before.loc[both, "second_homes"],
+    "second_homes_2025": after.loc[both, "second_homes"],
+    "empty_total_2024": before.loc[both, "empty_total"],
+    "empty_total_2025": after.loc[both, "empty_total"],
+    "empty_6m_2024": before.loc[both, "empty_over_6m"],
+    "empty_6m_2025": after.loc[both, "empty_over_6m"],
+    "chargeable_2025": after.loc[both, "chargeable_adj"],
+    "sh_per1000_2024": before.loc[both, "second_homes_per_1000"],
+    "sh_per1000_2025": after.loc[both, "second_homes_per_1000"],
+    "empty_per1000_2024": before.loc[both, "empty_total_per_1000"],
+    "empty_per1000_2025": after.loc[both, "empty_total_per_1000"],
+    "pct_sh_charged_premium_2025": after.loc[both, "pct_second_homes_charged_premium"],
 }).reset_index(drop=True)
 
-chg["second_homes_chg"] = chg.second_homes_2025 - chg.second_homes_2024
-chg["empty_total_chg"] = chg.empty_total_2025 - chg.empty_total_2024
-chg["sh_per1000_chg"] = (chg.sh_per1000_2025 - chg.sh_per1000_2024).round(2)
-chg["empty_per1000_chg"] = (chg.empty_per1000_2025 - chg.empty_per1000_2024).round(2)
-chg["second_homes_pct_chg"] = (chg.second_homes_chg / chg.second_homes_2024.replace(0, np.nan) * 100).round(1)
-chg["empty_total_pct_chg"] = (chg.empty_total_chg / chg.empty_total_2024.replace(0, np.nan) * 100).round(1)
-chg["quadrant"] = np.select(
-    [(chg.sh_per1000_chg < 0) & (chg.empty_per1000_chg > 0),
-     (chg.sh_per1000_chg < 0) & (chg.empty_per1000_chg <= 0),
-     (chg.sh_per1000_chg >= 0) & (chg.empty_per1000_chg > 0)],
-    ["Second homes down, empty up", "Both down", "Both up"],
-    default="Second homes up, empty down")
+change["second_homes_chg"] = change.second_homes_2025 - change.second_homes_2024
+change["empty_total_chg"] = change.empty_total_2025 - change.empty_total_2024
+change["sh_per1000_chg"] = (change.sh_per1000_2025 - change.sh_per1000_2024).round(2)
+change["empty_per1000_chg"] = (change.empty_per1000_2025 - change.empty_per1000_2024).round(2)
+change["second_homes_pct_chg"] = (
+    change.second_homes_chg / change.second_homes_2024.replace(0, float("nan")) * 100).round(1)
+change["empty_total_pct_chg"] = (
+    change.empty_total_chg / change.empty_total_2024.replace(0, float("nan")) * 100).round(1)
 
-# Flag implausible year-on-year swings, almost certainly reporting corrections
-# (the 2025 release revised 22 authorities without restating 2024), not real movement.
-chg["suspect_yoy"] = (
-    (chg.second_homes_pct_chg.abs() > 100) | (chg.empty_total_pct_chg.abs() > 100)
-) & (chg.second_homes_2024.fillna(0) + chg.empty_total_2024.fillna(0) > 100)
+# empty homes on the 6 month definition, per 1,000, which is what the scatter uses
+chargeable_2025 = change.chargeable_2025.replace(0, float("nan"))
+change["empty_6m_per1000_2024"] = (change.empty_6m_2024 / chargeable_2025 * 1000).round(2)
+change["empty_6m_per1000_2025"] = (change.empty_6m_2025 / chargeable_2025 * 1000).round(2)
+change["empty_6m_per1000_chg"] = (change.empty_6m_per1000_2025 - change.empty_6m_per1000_2024).round(2)
 
-chg.to_csv(f"{OUT}/ctb_la_change_2024_2025.csv", index=False)
 
-print(f"  headline rows: {len(w):,}  | change rows: {len(chg):,}")
-print("\nENGLAND CHECK (2025):")
-eng = w[(w.year == 2025) & (w.ons_code == "E92000001")]
-print(eng[[c for c in ["second_homes", "second_homes_premium", "empty_total",
-                       "empty_premium", "chargeable_adj"] if c in eng]].to_string(index=False))
+def quadrant(row):
+    if row.sh_per1000_chg < 0 and row.empty_per1000_chg > 0:
+        return "Second homes down, empty up"
+    if row.sh_per1000_chg < 0:
+        return "Both down"
+    if row.empty_per1000_chg > 0:
+        return "Both up"
+    return "Second homes up, empty down"
+
+
+change["quadrant"] = change.apply(quadrant, axis=1)
+
+# A jump of more than 100% either way, on an authority big enough that it
+# cannot be a rounding effect, is almost certainly a reporting correction
+# rather than real movement. MHCLG revised 22 authorities in the 2025 release
+# without restating 2024, which is where these come from. Ten authorities are
+# flagged and they are excluded from the comparison charts.
+change["suspect_yoy"] = (
+    ((change.second_homes_pct_chg.abs() > 100) | (change.empty_total_pct_chg.abs() > 100))
+    & (change.second_homes_2024.fillna(0) + change.empty_total_2024.fillna(0) > 100)
+)
+
+change.to_csv(OUT + "/ctb_la_change_2024_2025.csv", index=False)
+print("change rows:", len(change), " flagged suspect:", int(change.suspect_yoy.sum()))
