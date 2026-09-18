@@ -259,11 +259,7 @@ def quadrant(row):
 
 change["quadrant"] = change.apply(quadrant, axis=1)
 
-# A jump of more than 100% either way, on an authority big enough that it
-# cannot be a rounding effect, is almost certainly a reporting correction
-# rather than real movement. MHCLG revised 22 authorities in the 2025 release
-# without restating 2024, which is where these come from. Ten authorities are
-# flagged and they are excluded from the comparison charts.
+
 change["suspect_yoy"] = (
     ((change.second_homes_pct_chg.abs() > 100) | (change.empty_total_pct_chg.abs() > 100))
     & (change.second_homes_2024.fillna(0) + change.empty_total_2024.fillna(0) > 100)
